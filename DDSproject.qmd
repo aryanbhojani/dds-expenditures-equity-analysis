@@ -1,0 +1,409 @@
+---
+title: "DDS Expenditure Equity Analysis"
+subtitle: "Exploratory, permutation, and regression analysis of California DDS service expenditures"
+author: "Aryan Bhojani"
+format:
+  pdf:
+    pdf-engine: xelatex
+  html:
+    html-math-method: mathjax
+execute:
+  eval: true
+  echo: true
+  message: false
+  warning: false
+---
+
+```{r}
+library(tidyverse)
+library(broom)
+library(hexbin)
+```
+
+# Project overview
+
+This project analyzes a de-identified sample of California Department of Developmental Services (DDS) client records to evaluate whether service expenditures differ systematically by ethnicity and gender, and to understand how age structure can drive misleading aggregate comparisons (a Simpson's paradox style pattern).
+
+The workflow has three parts:
+
+1) Exploratory comparisons of expenditures across ethnicity, age, and gender
+2) A permutation test within a fixed age cohort comparing minority vs non-minority expenditures
+3) A regression model of log expenditures adjusting for age cohort, gender, and ethnicity
+
+All results are descriptive associations based on a de-identified administrative dataset.
+
+
+```{r}
+dds <- read_csv("data/california-dds2.csv", show_col_types = FALSE)
+
+names(dds) <- names(dds) |>
+  stringr::str_replace_all("\u00A0", " ") |>
+  stringr::str_squish()
+
+glimpse(dds)
+```
+
+```{r}
+cohort_levels <- c("0 to 5", "6 to 12", "13 to 17", "18 to 21", "22 to 50", "51+")
+
+dds_cat <- dds |>
+  filter(!is.na(Age_cohort)) |>
+  filter(Age_cohort %in% cohort_levels) |>
+  mutate(across(c(Age_cohort, Ethnicity, Gender), as.factor)) |>
+  mutate(Age_cohort = factor(Age_cohort, levels = cohort_levels))
+```
+
+# Exploratory analysis
+
+## Median expenditures by ethnicity
+
+I start by comparing median annual expenditures across ethnic groups and recording sample size per group.
+
+```{r}
+median_exp_by_eth <- dds_cat |>
+  group_by(Ethnicity) |>
+  summarise(
+    n = n(),
+    median_expenditure = median(Expenditures, na.rm = TRUE),
+    mean_expenditure = mean(Expenditures, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  arrange(desc(median_expenditure))
+
+median_exp_by_eth
+```
+
+## Figure 1: Median expenditures by ethnicity (log scale)
+
+This plot orders ethnicities from highest to lowest median expenditure and uses a log scale to display the wide spread.
+
+```{r}
+median_exp_by_eth_plot <- median_exp_by_eth |>
+  mutate(Ethnicity = reorder(Ethnicity, -median_expenditure))
+
+fig_1 <- ggplot(median_exp_by_eth_plot, aes(x = Ethnicity, y = median_expenditure)) +
+  geom_line(aes(group = 1)) +
+  geom_point() +
+  scale_y_log10() +
+  labs(
+    x = NULL,
+    y = "Median expenditure (log scale)"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+fig_1
+```
+
+## Figure 2: Expenditures vs age (hexbin, log scale)
+
+This heatmap shows the overall relationship between age and expenditures. The log scale helps visualize extreme right skew.
+
+```{r}
+fig_2 <- ggplot(dds, aes(x = Age, y = Expenditures)) +
+  geom_hex() +
+  scale_y_log10() +
+  labs(
+    x = "Age (years)",
+    y = "Expenditures (log scale)",
+    fill = "Count"
+  ) +
+  theme_minimal()
+
+fig_2
+```
+
+## Figure 3: Sample size by age cohort and ethnicity
+
+Different ethnic groups have different age composition in the sample, which can confound aggregate expenditure comparisons.
+
+```{r}
+samp_sizes <- dds_cat |>
+  group_by(Age_cohort, Ethnicity) |>
+  summarise(n = n(), .groups = "drop")
+
+fig_3 <- ggplot(samp_sizes, aes(x = Age_cohort, y = n, color = Ethnicity, group = Ethnicity)) +
+  geom_line() +
+  geom_point() +
+  labs(
+    x = "Age cohort",
+    y = "Sample size"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+fig_3
+```
+
+## Figure 4: Median expenditures by ethnicity within each age cohort
+
+This plot compares ethnicities within age cohorts (color), reducing confounding due to different age composition.
+
+```{r}
+eth_order <- dds_cat |>
+  group_by(Ethnicity) |>
+  summarise(med = median(Expenditures, na.rm = TRUE), .groups = "drop") |>
+  arrange(desc(med)) |>
+  pull(Ethnicity)
+
+dds_cat_ordered <- dds_cat |>
+  mutate(Ethnicity = factor(Ethnicity, levels = eth_order))
+
+med_by_eth_age <- dds_cat_ordered |>
+  group_by(Ethnicity, Age_cohort) |>
+  summarise(median_expenditure = median(Expenditures, na.rm = TRUE), .groups = "drop")
+
+fig_4 <- ggplot(med_by_eth_age, aes(x = Ethnicity, y = median_expenditure, color = Age_cohort, group = Age_cohort)) +
+  geom_line() +
+  geom_point() +
+  scale_y_log10() +
+  labs(
+    x = NULL,
+    y = "Median expenditure (log scale)",
+    color = "Age cohort"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+fig_4
+```
+
+# Statistical inference: permutation test within a fixed age cohort
+
+To reduce confounding, I focus on a single age cohort (13 to 17) and test whether mean expenditures differ between:
+
+- Non-minority: White not Hispanic
+- Minority: all other ethnicities
+
+This is a permutation test: shuffle the group labels many times to approximate the null distribution of the mean difference.
+
+## Create minority indicator and subset to age 13 to 17
+
+```{r}
+dds_perm <- dds_cat |>
+  mutate(
+    Minority = if_else(Ethnicity == "White not Hispanic", "Non-minority", "Minority"),
+    Minority = factor(Minority, levels = c("Non-minority", "Minority"))
+  ) |>
+  filter(Age_cohort == "13 to 17")
+
+dds_perm |>
+  count(Minority)
+```
+
+## Observed mean difference function (base R)
+
+```{r}
+compute_mean_diff <- function(dat) {
+  is_minority <- dat$Minority == "Minority"
+  mean_minority    <- mean(dat$Expenditures[is_minority],  na.rm = TRUE)
+  mean_nonminority <- mean(dat$Expenditures[!is_minority], na.rm = TRUE)
+  mean_minority - mean_nonminority
+}
+
+obs_diff <- compute_mean_diff(dds_perm)
+obs_diff
+```
+
+## Permutation distribution and p-value
+
+```{r}
+set.seed(2004)
+
+n_perm <- 5000
+perm_diffs <- numeric(n_perm)
+
+for (b in 1:n_perm) {
+  perm_dat <- dds_perm
+  perm_dat$Minority <- sample(perm_dat$Minority)
+  perm_diffs[b] <- compute_mean_diff(perm_dat)
+}
+
+p_val <- mean(abs(perm_diffs) >= abs(obs_diff))
+p_val
+```
+
+```{r}
+perm_df <- tibble(diff = perm_diffs)
+
+fig_perm <- ggplot(perm_df, aes(x = diff)) +
+  geom_histogram(bins = 40, color = "white") +
+  geom_vline(xintercept = obs_diff, linewidth = 1) +
+  labs(
+    x = "Mean difference (Minority - Non-minority)",
+    y = "Count",
+    title = "Permutation distribution of mean expenditure differences (age 13 to 17)"
+  ) +
+  theme_minimal()
+
+fig_perm
+```
+
+# Regression analysis: adjusting for age cohort, gender, and ethnicity
+
+To quantify differences while adjusting for confounding, I fit a linear model for log expenditures:
+
+log(Expenditures) = f(Age cohort) + f(Gender) + f(Ethnicity) + error
+
+This is an association model (not causal). Coefficients represent differences relative to reference categories.
+
+## Prepare reference categories
+
+- Age cohort baseline: 0 to 5
+- Ethnicity baseline: White not Hispanic
+
+```{r}
+dds_reg <- dds_cat |>
+  mutate(
+    Ethnicity = relevel(Ethnicity, ref = "White not Hispanic")
+  ) |>
+  filter(Expenditures > 0)
+
+levels(dds_reg$Age_cohort)
+levels(dds_reg$Ethnicity)[1:5]
+```
+
+## Fit model and extract coefficients
+
+```{r}
+expenditures_lm <- lm(
+  log(Expenditures) ~ Age_cohort + Gender + Ethnicity,
+  data = dds_reg
+)
+
+coef_tbl <- tidy(expenditures_lm)
+coef_tbl
+```
+
+## Bootstrap standard error for the 6 to 12 coefficient
+
+This estimates uncertainty for the age 6 to 12 indicator by resampling individuals with replacement and refitting the model.
+
+```{r}
+set.seed(2004)
+
+n_boot <- 2000
+boot_beta <- numeric(n_boot)
+
+for (i in 1:n_boot) {
+  idx <- sample(seq_len(nrow(dds_reg)), size = nrow(dds_reg), replace = TRUE)
+  boot_dat <- dds_reg[idx, ]
+  fit_boot <- lm(log(Expenditures) ~ Age_cohort + Gender + Ethnicity, data = boot_dat)
+  boot_beta[i] <- coef(fit_boot)["Age_cohort6 to 12"]
+}
+
+boot_se <- sd(boot_beta)
+boot_se
+```
+
+# Discussion of results
+
+```{r, echo=FALSE, results="asis"}
+overall_medians <- dds_cat |>
+  group_by(Ethnicity) |>
+  summarise(
+    med = median(Expenditures, na.rm = TRUE),
+    n = n(),
+    .groups = "drop"
+  ) |>
+  arrange(desc(med))
+
+top_eth <- overall_medians |> slice(1)
+bot_eth <- overall_medians |> slice(n())
+
+small_groups <- overall_medians |>
+  filter(n < 30) |>
+  arrange(n)
+
+n_small_groups <- nrow(small_groups)
+
+age_medians <- dds_cat |>
+  group_by(Age_cohort) |>
+  summarise(
+    med = median(Expenditures, na.rm = TRUE),
+    n = n(),
+    .groups = "drop"
+  )
+
+top_age <- age_medians |> arrange(desc(med)) |> slice(1)
+bot_age <- age_medians |> arrange(med) |> slice(1)
+
+gender_medians <- dds_cat |>
+  group_by(Gender) |>
+  summarise(
+    med = median(Expenditures, na.rm = TRUE),
+    n = n(),
+    .groups = "drop"
+  ) |>
+  arrange(desc(med))
+
+beta_age_6_12 <- unname(coef(expenditures_lm)["Age_cohort6 to 12"])
+se_age_6_12_lm <- coef_tbl |> filter(term == "Age_cohort6 to 12") |> pull(std.error)
+
+cat("# Summary and interpretation\n\n")
+
+cat("## What the raw comparisons show\n\n")
+cat(paste0(
+  "- Median expenditures vary across ethnic groups in this sample. The highest-median group is ",
+  as.character(top_eth$Ethnicity),
+  " (median about $", round(top_eth$med, 0),
+  ", n = ", top_eth$n,
+  "), while the lowest-median group is ",
+  as.character(bot_eth$Ethnicity),
+  " (median about $", round(bot_eth$med, 0),
+  ", n = ", bot_eth$n, ").\n"
+))
+
+cat("- Important caveat: some ethnicity categories have very small sample sizes, so their medians can be unstable and should not be overinterpreted.\n")
+if (n_small_groups > 0) {
+  cat(paste0(
+    "- In this dataset, there are ", n_small_groups,
+    " ethnicity categories with fewer than 30 observations.\n"
+  ))
+}
+cat("- Because expenditures are highly right-skewed, medians and log-scale plots are more informative than raw means for comparing typical spending.\n\n")
+
+cat("## Age is strongly related to expenditures\n\n")
+cat(paste0(
+  "- Expenditures differ sharply by age cohort. The cohort with the lowest median is ",
+  as.character(bot_age$Age_cohort),
+  " (median about $", round(bot_age$med, 0),
+  ", n = ", bot_age$n,
+  "), and the cohort with the highest median is ",
+  as.character(top_age$Age_cohort),
+  " (median about $", round(top_age$med, 0),
+  ", n = ", top_age$n, ").\n"
+))
+cat("- The age vs expenditure hex plot shows a dense band of low expenditures with a long upper tail at many ages, consistent with extreme right skew.\n\n")
+
+cat("## Why aggregate ethnicity comparisons can be misleading\n\n")
+cat("- The sample size plot by age cohort and ethnicity shows that ethnic groups have different age composition.\n")
+cat("- If some ethnic groups contain more children (lower typical spending), their overall median can look smaller even if within-cohort spending is similar.\n")
+cat("- The within-cohort median plot reduces this confounding and helps separate age structure from ethnicity differences.\n\n")
+
+cat("## Permutation test within age 13 to 17\n\n")
+cat(paste0(
+  "- Observed mean difference (Minority - Non-minority) in age 13 to 17 is about $",
+  round(obs_diff, 1), ".\n"
+))
+cat(paste0(
+  "- Two-sided permutation p-value with ", n_perm, " shuffles is about ",
+  round(p_val, 3), ".\n"
+))
+cat("- A large p-value means the observed difference is not unusual under random relabeling, so this subgroup test does not provide strong evidence of a systematic minority vs non-minority mean difference in this cohort.\n\n")
+
+cat("## Regression results adjusting for age cohort, gender, and ethnicity\n\n")
+cat(paste0(
+  "- The age 6 to 12 coefficient in the log-expenditure model is about ",
+  round(beta_age_6_12, 3),
+  " with model-based SE about ",
+  round(se_age_6_12_lm, 3),
+  " and bootstrap SE about ",
+  round(boot_se, 3),
+  ".\n"
+))
+cat("- After adjusting for age cohort, gender, and ethnicity, age cohort effects remain large, matching the exploratory finding that age is a major driver of spending differences in this sample.\n\n")
+
+cat("## Overall conclusion\n\n")
+cat("The dataset shows apparent differences in raw expenditures across ethnic groups, but strong age effects and different age composition across ethnicities can explain much of the aggregate disparity. The within-cohort visualization, the permutation test in a fixed age cohort, and the adjusted regression model all point to age cohort as the dominant predictor of spending in this sample. Evidence for systematic ethnicity or gender differences is weaker after controlling for age. These results are descriptive associations from de-identified administrative records, not causal estimates.\n")
+```
